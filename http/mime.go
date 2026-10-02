@@ -4,11 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
-	"io/ioutil"
-	"mime/multipart"
 	"net/textproto"
+	"strconv"
 	"strings"
 
 	"github.com/tidwall/transform"
@@ -99,42 +97,48 @@ func fromWSMV(r io.Reader) io.Reader {
 }
 
 func Wrap(input []byte, ct string, origLength int) ([]byte, string, error) {
-	b := &bytes.Buffer{}
+	// The WSMV body is built byte-for-byte here on purpose.
+	//
+	// The previous implementation produced the body with multipart.Writer and then
+	// ran the result through toWSMV(), a line-oriented transform that splits on
+	// newlines and injects CRLF around anything resembling the boundary. The
+	// octet-stream part is RC4 ciphertext, i.e. uniformly random bytes, so that
+	// transform mutated the encrypted payload whenever the ciphertext happened to
+	// contain such a byte pattern: the payload grew (or shrank) by 1-3 bytes, no
+	// longer matched the declared OriginalContent Length, and WinRM rejected the
+	// request with a bare HTTP 400. The probability scales with ciphertext size
+	// (~2% at 2 KB, ~23% at 16 KB, ~59% at 64 KB).
+	var b bytes.Buffer
+	b.Grow(len(input) + 256)
 
-	writer := multipart.NewWriter(b)
-	if err := writer.SetBoundary(mimeBoundary); err != nil {
-		return nil, "", err
-	}
+	b.WriteString(dashBoundary)
+	b.WriteString("\r\n\t")
+	b.WriteString(contentTypeHeader)
+	b.WriteString(": ")
+	b.WriteString(mimeProtocol)
+	b.WriteString("\r\n\t")
+	// Not using textproto here: it canonicalises the key to "Originalcontent",
+	// which WinRM rejects.
+	b.WriteString("OriginalContent: type=")
+	b.WriteString(ct)
+	b.WriteString(";Length=")
+	b.WriteString(strconv.Itoa(origLength))
+	b.WriteString("\r\n")
 
-	header := make(textproto.MIMEHeader)
-	header.Set(contentTypeHeader, mimeProtocol)
-	// Using Set() will canonicalise this to "Originalcontent" which may cause problems
-	header["OriginalContent"] = []string{fmt.Sprintf("type=%s;Length=%d", ct, origLength)}
+	b.WriteString(dashBoundary)
+	b.WriteString("\r\n\t")
+	b.WriteString(contentTypeHeader)
+	b.WriteString(": ")
+	b.WriteString(octetStream)
+	b.WriteString("\r\n")
 
-	if _, err := writer.CreatePart(header); err != nil {
-		return nil, "", err
-	}
+	// Binary payload, written verbatim - never transformed.
+	b.Write(input)
 
-	body := make(textproto.MIMEHeader)
-	body.Set(contentTypeHeader, octetStream)
+	b.WriteString(dashBoundary)
+	b.WriteString("--\r\n")
 
-	part, err := writer.CreatePart(body)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if _, err := io.Copy(part, bytes.NewBuffer(input)); err != nil {
-		return nil, "", err
-	}
-
-	writer.Close()
-
-	output, err := ioutil.ReadAll(toWSMV(b))
-	if err != nil {
-		return nil, "", err
-	}
-
-	return output, contentTypeValue, nil
+	return b.Bytes(), contentTypeValue, nil
 }
 
 func Unwrap(input []byte, ct string) ([]byte, string, error) {
@@ -142,45 +146,40 @@ func Unwrap(input []byte, ct string) ([]byte, string, error) {
 		return nil, "", errors.New("incorrect Content-Type value")
 	}
 
-	reader := multipart.NewReader(fromWSMV(bytes.NewBuffer(input)), mimeBoundary)
-	output := bytes.Buffer{}
+	// Parsed directly rather than with fromWSMV()+multipart.Reader. Both are
+	// line-oriented: the transform rewrites CRLF around boundary-looking byte
+	// sequences, and multipart.Reader strips the CRLF preceding a boundary. The
+	// octet-stream part is RC4 ciphertext (uniformly random bytes), so either step
+	// can add or remove bytes, after which the signature check fails with
+	// "checksum does not match". See Wrap for the outbound side of the same bug.
+	hdr := []byte("OriginalContent:")
+	h := bytes.Index(input, hdr)
+	if h < 0 {
+		return nil, "", errors.New("missing OriginalContent header")
+	}
+	eol := bytes.Index(input[h:], []byte("\r\n"))
+	if eol < 0 {
+		return nil, "", errors.New("malformed OriginalContent header")
+	}
+	originalContent := string(bytes.TrimSpace(input[h+len(hdr) : h+eol]))
 
-	var originalContent string
+	marker := []byte(contentTypeHeader + ": " + octetStream + "\r\n")
+	m := bytes.Index(input, marker)
+	if m < 0 {
+		return nil, "", errors.New("missing octet-stream part")
+	}
+	payload := input[m+len(marker):]
 
-Loop:
-	for i := 0; true; i++ {
-		part, err := reader.NextPart()
-		switch err {
-		case nil:
-			break
-		case io.EOF:
-			break Loop
-		default:
-			return nil, "", err
-		}
-
-		switch i {
-		case 0:
-			if part.Header.Get(contentTypeHeader) != mimeProtocol {
-				return nil, "", errors.New("incorrect Content-Type value")
-			}
-			if originalContent = part.Header.Get("OriginalContent"); originalContent == "" {
-				return nil, "", errors.New("missing OriginalContent header")
-			}
-		case 1:
-			if part.Header.Get(contentTypeHeader) != octetStream {
-				return nil, "", errors.New("incorrect Content-Type value")
-			}
-			if _, err := output.ReadFrom(part); err != nil {
-				return nil, "", err
-			}
-		default:
-			return nil, "", errors.New("additional MIME parts encountered")
-		}
+	trailer := []byte(dashBoundary + "--")
+	if t := bytes.LastIndex(payload, trailer); t >= 0 {
+		payload = payload[:t]
 	}
 
 	// TODO Better way of parsing this
 	parts := strings.Split(originalContent, ";")
+	if len(parts) < 2 || len(parts[0]) < 5 {
+		return nil, "", errors.New("malformed OriginalContent header")
+	}
 
-	return output.Bytes(), parts[0][5:] + ";" + parts[1], nil
+	return payload, parts[0][5:] + ";" + parts[1], nil
 }

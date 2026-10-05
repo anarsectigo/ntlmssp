@@ -371,7 +371,7 @@ func TestClient(t *testing.T) {
 	}
 
 	for _, table := range tables {
-		client, err := NewClient(SetDomain(table.domain), SetUserInfo(table.username, table.password), SetWorkstation(table.workstation), SetVersion(table.version))
+		client, err := NewClient(SetDomain(table.domain), SetUserInfo(table.username, table.password, nil), SetWorkstation(table.workstation), SetVersion(table.version))
 		assert.Nil(t, err)
 
 		negotiate, err := client.Authenticate(nil, nil)

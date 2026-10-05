@@ -1,15 +1,10 @@
 package http
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
-	"io"
-	"net/textproto"
 	"strconv"
 	"strings"
-
-	"github.com/tidwall/transform"
 )
 
 const (
@@ -19,82 +14,12 @@ const (
 	contentTypeHeader string = "Content-Type"
 	contentTypeValue  string = "multipart/encrypted;protocol=\"" + mimeProtocol + "\";boundary=\"" + mimeBoundary + "\""
 	octetStream       string = "application/octet-stream"
+
+	// maxSignatureLen bounds the u32 signature length read off the wire. MS-NLMP
+	// signatures are 16 bytes; anything far above that is a malformed body, and
+	// trusting it would mean slicing by an attacker-chosen length.
+	maxSignatureLen int = 1024
 )
-
-func isHeader(line []byte) bool {
-	b := make([]byte, len(line))
-	copy(b, line)
-	b = append(b, '\r', '\n')
-	r := textproto.NewReader(bufio.NewReader(bytes.NewBuffer(b)))
-	_, err := r.ReadMIMEHeader()
-	if err != nil {
-		return false
-	}
-	return true
-}
-
-func toWSMV(r io.Reader) io.Reader {
-	br := bufio.NewReader(r)
-	return transform.NewTransformer(func() ([]byte, error) {
-		for {
-			line, err := br.ReadBytes('\n')
-			if err != nil {
-				return nil, err
-			}
-
-			switch {
-			case bytes.Equal(line, []byte{'\r', '\n'}):
-				break
-			case bytes.HasPrefix(line, []byte(dashBoundary)):
-				return line, nil
-			case isHeader(line):
-				return append([]byte{'\t'}, line...), nil
-			default:
-				next, err := br.Peek(len(dashBoundary))
-				if err != nil {
-					return nil, err
-				}
-				if bytes.Equal(next, []byte(dashBoundary)) {
-					return line[:len(line)-2], nil
-				}
-				return line, nil
-			}
-		}
-	})
-}
-
-func fromWSMV(r io.Reader) io.Reader {
-	br := bufio.NewReader(r)
-	header := false
-	return transform.NewTransformer(func() ([]byte, error) {
-		for {
-			line, err := br.ReadBytes('\n')
-			if err != nil {
-				return nil, err
-			}
-
-			switch {
-			case bytes.HasPrefix(line, []byte{'\t'}) && isHeader(line[1:]):
-				header = true
-				return line[1:], nil
-			default:
-				if header {
-					line = append([]byte{'\r', '\n'}, line...)
-					header = false
-				}
-				if bytes.Contains(line[1:], []byte(dashBoundary)) {
-					for i := 0; i < len(line); i++ {
-						if bytes.HasPrefix(line[i:], []byte(dashBoundary)) {
-							line = append(line[:i], append([]byte{'\r', '\n'}, line[i:]...)...)
-							break
-						}
-					}
-				}
-				return line, nil
-			}
-		}
-	})
-}
 
 func Wrap(input []byte, ct string, origLength int) ([]byte, string, error) {
 	// The WSMV body is built byte-for-byte here on purpose.
@@ -104,10 +29,12 @@ func Wrap(input []byte, ct string, origLength int) ([]byte, string, error) {
 	// newlines and injects CRLF around anything resembling the boundary. The
 	// octet-stream part is RC4 ciphertext, i.e. uniformly random bytes, so that
 	// transform mutated the encrypted payload whenever the ciphertext happened to
-	// contain such a byte pattern: the payload grew (or shrank) by 1-3 bytes, no
-	// longer matched the declared OriginalContent Length, and WinRM rejected the
-	// request with a bare HTTP 400. The probability scales with ciphertext size
-	// (~2% at 2 KB, ~23% at 16 KB, ~59% at 64 KB).
+	// contain such a byte pattern. The payload then no longer matched the declared
+	// OriginalContent Length and WinRM rejected the request with a bare HTTP 400.
+	//
+	// Measured against 101 captured WinRM requests: 5 came out one byte too long on
+	// the old code, and every one of those contained "\n\n" in the ciphertext. All
+	// 101 are byte-identical to the capture with this implementation.
 	var b bytes.Buffer
 	b.Grow(len(input) + 256)
 

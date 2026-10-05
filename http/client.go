@@ -12,6 +12,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
 	"github.com/hashicorp/go-cleanhttp"
@@ -20,9 +21,27 @@ import (
 
 var (
 	httpAuthenticateHeader = textproto.CanonicalMIMEHeaderKey("WWW-Authenticate")
+
+	// ErrMalformedEncryptedBody reports a multipart/encrypted body that does not
+	// match MS-WSMV 2.2.9.1.1.2: wrong framing, or a length field that does not
+	// agree with the bytes present. Returned instead of panicking on a short body.
+	ErrMalformedEncryptedBody = errors.New("ntlmssp: malformed encrypted body")
+
+	// ErrResponseUnwrap reports a response that the server accepted and acted on,
+	// but which could not be unsealed or verified. The request MUST NOT be resent:
+	// the server has already executed it.
+	ErrResponseUnwrap = errors.New("ntlmssp: cannot unwrap response")
 )
 
 type Client struct {
+	// mu serializes wrap -> send -> unwrap for the whole client. The NTLM security
+	// session carries a sequence number and an RC4 keystream that both sides step in
+	// lockstep, so two requests in flight on one client desynchronise it and every
+	// later message fails. Do and RoundTrip are safe for concurrent use because of
+	// this lock; the exchange itself stays sequential, which is what NTLM requires.
+	// This also assumes a single keep-alive connection, which NewClient enforces by
+	// refusing a transport with DisableKeepAlives.
+	mu         sync.Mutex
 	http       *http.Client
 	ntlm       *ntlmssp.Client
 	encryption bool
@@ -156,12 +175,12 @@ func (c *Client) unwrap(resp *http.Response) error {
 			return err
 		}
 
-		length := binary.LittleEndian.Uint32(data[:4])
+		signature, ciphertext, err := splitSealedPayload(data)
+		if err != nil {
+			return err
+		}
 
-		signature := make([]byte, length)
-		copy(signature, data[4:4+length])
-
-		body, err := session.Unwrap(data[4+length:], signature)
+		body, err := session.Unwrap(ciphertext, signature)
 		if err != nil {
 			return err
 		}
@@ -176,6 +195,9 @@ func (c *Client) unwrap(resp *http.Response) error {
 
 // refactor all the things!
 func (c *Client) Do(req *http.Request) (resp *http.Response, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	savedBody, err := saveBody(req)
 	if err != nil {
 		return nil, err
@@ -205,15 +227,14 @@ func (c *Client) Do(req *http.Request) (resp *http.Response, err error) {
 			if c.encryption {
 
 				if unwrapErr := c.unwrap(resp); unwrapErr != nil {
-					if !isSessionError(unwrapErr) {
-
-						return nil, unwrapErr
-					}
-					emptyAndCloseBody(req.Body)
-				} else {
-
-					return resp, nil
+					// The server accepted this request and acted on it. Resending it
+					// would run the command twice, so the session is reset for the
+					// next call and the failure is reported to the caller instead.
+					c.ntlm.Reset()
+					return nil, fmt.Errorf("%w: %w", ErrResponseUnwrap, unwrapErr)
 				}
+
+				return resp, nil
 			} else {
 
 				return resp, nil
@@ -302,10 +323,35 @@ func (c *Client) Do(req *http.Request) (resp *http.Response, err error) {
 	}
 	return resp, nil
 }
+
+// isSessionError reports a failure that means the NTLM session itself is spent, so
+// the next sealed operation needs a fresh handshake. It is used only to decide
+// whether to Reset, never to decide whether to resend: a 2xx response the server has
+// already acted on must not be replayed. io.ErrUnexpectedEOF is deliberately absent
+// — it is a framing failure, and matching it here turned one into a silent replay.
 func isSessionError(err error) bool {
 	return errors.Is(err, ntlmssp.ErrChecksumMismatch) ||
-		errors.Is(err, ntlmssp.ErrSeqNumMismatch) ||
-		errors.Is(err, io.ErrUnexpectedEOF)
+		errors.Is(err, ntlmssp.ErrSeqNumMismatch)
+}
+
+// splitSealedPayload splits the MS-WSMV payload "u32 signature length, signature,
+// ciphertext" with every length checked, so a short or hostile body is an error
+// rather than a panic.
+func splitSealedPayload(data []byte) (signature, ciphertext []byte, err error) {
+	if len(data) < 4 {
+		return nil, nil, fmt.Errorf("%w: payload is %d bytes, need at least 4 for the signature length",
+			ErrMalformedEncryptedBody, len(data))
+	}
+	sigLen := int(binary.LittleEndian.Uint32(data[:4]))
+	if sigLen < 0 || sigLen > maxSignatureLen {
+		return nil, nil, fmt.Errorf("%w: signature length %d out of range",
+			ErrMalformedEncryptedBody, sigLen)
+	}
+	if 4+sigLen > len(data) {
+		return nil, nil, fmt.Errorf("%w: signature length %d exceeds the %d bytes present",
+			ErrMalformedEncryptedBody, sigLen, len(data)-4)
+	}
+	return data[4 : 4+sigLen], data[4+sigLen:], nil
 }
 func saveBody(req *http.Request) ([]byte, error) {
 	if req.Body == nil {

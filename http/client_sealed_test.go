@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/investigato/ntlmssp"
 )
@@ -197,5 +199,48 @@ func TestDoSerializesConcurrentCallers(t *testing.T) {
 	}
 	if want := int64(goroutines * perGoroutine); srv.received.Load() != want {
 		t.Errorf("server saw %d requests, want %d", srv.received.Load(), want)
+	}
+}
+
+// A long-poll holding the gate must not strand the next caller. WinRM Receive
+// operations block for up to a minute, so waiting for the session has to honour the
+// request context — otherwise a cancel, a Signal, or a call that never returns takes
+// the whole client with it.
+func TestDoGateHonoursContextWhileHeld(t *testing.T) {
+	c, _, ts := newSealedPair(t)
+
+	release := make(chan struct{})
+	held := make(chan struct{})
+
+	// First caller takes the gate and stays in flight.
+	go func() {
+		req := sealedRequest(t, ts.URL)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req = req.WithContext(ctx)
+
+		if err := c.acquire(req.Context()); err != nil {
+			return
+		}
+		close(held)
+		<-release
+		c.release()
+	}()
+	<-held
+
+	// Second caller gives up at its deadline rather than queueing behind the poll.
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := c.Do(sealedRequest(t, ts.URL).WithContext(ctx))
+	elapsed := time.Since(start)
+	close(release)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("waited %v for the gate; it should give up at the deadline", elapsed)
 	}
 }

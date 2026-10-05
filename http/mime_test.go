@@ -196,3 +196,83 @@ func FuzzUnwrap(f *testing.F) {
 		_, _, _ = splitSealedPayload(input)
 	})
 }
+
+// MS-WSMV makes the body length-delimited, so these are the cases that delimiting by
+// the closing boundary instead would get wrong.
+func TestUnwrapUsesDeclaredLength(t *testing.T) {
+	ciphertext := []byte("payload with a --Encrypted Boundary-- inside it")
+	payload := sealed(ciphertext)
+
+	body, ct, err := Wrap(payload, soapCT, len(ciphertext))
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+
+	// Searching for the last trailer would stop at the one inside the ciphertext.
+	got, _, err := Unwrap(body, ct)
+	if err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("payload truncated at an embedded delimiter\n got %q\nwant %q", got, payload)
+	}
+}
+
+func TestUnwrapRejectsLengthMismatch(t *testing.T) {
+	ciphertext := []byte("twenty-four bytes long..")
+	body, ct, err := Wrap(sealed(ciphertext), soapCT, len(ciphertext)+8) // declare too much
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	if _, _, err := Unwrap(body, ct); !errors.Is(err, ErrMalformedEncryptedBody) {
+		t.Fatalf("err = %v, want ErrMalformedEncryptedBody", err)
+	}
+}
+
+func TestUnwrapRejectsMissingTrailer(t *testing.T) {
+	ciphertext := []byte("some ciphertext")
+	body, ct, err := Wrap(sealed(ciphertext), soapCT, len(ciphertext))
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	truncated := body[:bytes.LastIndex(body, []byte("--Encrypted Boundary--"))]
+
+	// The old trailer search accepted this silently.
+	if _, _, err := Unwrap(truncated, ct); !errors.Is(err, ErrMalformedEncryptedBody) {
+		t.Fatalf("err = %v, want ErrMalformedEncryptedBody", err)
+	}
+}
+
+// Windows sends no CRLF before the closing delimiter, but other implementations do,
+// and a tolerated CRLF must not be counted as payload.
+func TestUnwrapToleratesCRLFBeforeTrailer(t *testing.T) {
+	ciphertext := []byte("ciphertext")
+	payload := sealed(ciphertext)
+	body := append([]byte(nil), reference(payload, soapCT, len(ciphertext))...)
+	body = bytes.Replace(body,
+		append(payload, []byte("--Encrypted Boundary--")...),
+		append(payload, []byte("\r\n--Encrypted Boundary--")...), 1)
+
+	got, _, err := Unwrap(body, contentTypeValue)
+	if err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("payload = %q, want %q", got, payload)
+	}
+}
+
+func TestParseOriginalContentRejectsBadHeaders(t *testing.T) {
+	for name, value := range map[string]string{
+		"no length":           "type=application/soap+xml;charset=UTF-8",
+		"no type":             "charset=UTF-8;Length=10",
+		"length not a number": "type=application/soap+xml;charset=UTF-8;Length=abc",
+		"negative length":     "type=application/soap+xml;charset=UTF-8;Length=-1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := parseOriginalContent(value); !errors.Is(err, ErrMalformedEncryptedBody) {
+				t.Fatalf("err = %v, want ErrMalformedEncryptedBody", err)
+			}
+		})
+	}
+}

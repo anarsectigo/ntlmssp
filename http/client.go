@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -12,7 +13,6 @@ import (
 	"net/textproto"
 	"net/url"
 	"strings"
-	"sync"
 
 	"github.com/go-logr/logr"
 	"github.com/hashicorp/go-cleanhttp"
@@ -34,14 +34,20 @@ var (
 )
 
 type Client struct {
-	// mu serializes wrap -> send -> unwrap for the whole client. The NTLM security
+	// gate serializes wrap -> send -> unwrap for the whole client. The NTLM security
 	// session carries a sequence number and an RC4 keystream that both sides step in
 	// lockstep, so two requests in flight on one client desynchronise it and every
 	// later message fails. Do and RoundTrip are safe for concurrent use because of
-	// this lock; the exchange itself stays sequential, which is what NTLM requires.
+	// this gate; the exchange itself stays sequential, which is what NTLM requires.
 	// This also assumes a single keep-alive connection, which NewClient enforces by
 	// refusing a transport with DisableKeepAlives.
-	mu         sync.Mutex
+	//
+	// It is a channel rather than a sync.Mutex so that waiting for it honours the
+	// request context. WinRM Receive operations long-poll for up to a minute, so a
+	// plain Lock() would make a cancel or a Signal queue behind the poll with no way
+	// out, and a call that never returns would strand every later caller on the
+	// client. With this, a waiter leaves when its context is done.
+	gate       chan struct{}
 	http       *http.Client
 	ntlm       *ntlmssp.Client
 	encryption bool
@@ -80,6 +86,7 @@ func NewClient(httpClient *http.Client, ntlmClient *ntlmssp.Client, options ...f
 		http:   httpClient,
 		ntlm:   ntlmClient,
 		logger: logr.Discard(),
+		gate:   make(chan struct{}, 1),
 	}
 
 	if err := c.SetOption(options...); err != nil {
@@ -195,8 +202,10 @@ func (c *Client) unwrap(resp *http.Response) error {
 
 // refactor all the things!
 func (c *Client) Do(req *http.Request) (resp *http.Response, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.acquire(req.Context()); err != nil {
+		return nil, err
+	}
+	defer c.release()
 
 	savedBody, err := saveBody(req)
 	if err != nil {
@@ -322,6 +331,36 @@ func (c *Client) Do(req *http.Request) (resp *http.Response, err error) {
 		}
 	}
 	return resp, nil
+}
+
+// acquire takes the per-client gate, giving up if the context is done first. Callers
+// that time out or cancel therefore return promptly instead of waiting behind an
+// in-flight long-poll.
+func (c *Client) acquire(ctx context.Context) error {
+	if c.gate == nil {
+		// A Client built without NewClient; nothing to serialize against.
+		return nil
+	}
+	if ctx == nil {
+		c.gate <- struct{}{}
+		return nil
+	}
+	select {
+	case c.gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("ntlmssp: waiting for the session: %w", ctx.Err())
+	}
+}
+
+func (c *Client) release() {
+	if c.gate == nil {
+		return
+	}
+	select {
+	case <-c.gate:
+	default:
+	}
 }
 
 // isSessionError reports a failure that means the NTLM session itself is spent, so
